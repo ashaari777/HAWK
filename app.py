@@ -8,6 +8,8 @@ import asyncio
 import threading
 import random
 import requests
+import subprocess
+import sys
 
 from datetime import datetime, timedelta
 from functools import wraps
@@ -47,6 +49,10 @@ USER_AGENT = (
 
 app = Flask(__name__)
 app.secret_key = APP_SECRET
+
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
+_PLAYWRIGHT_INSTALL_LOCK = threading.Lock()
+_PLAYWRIGHT_INSTALL_TRIED = False
 
 
 # ---------------- DB helpers ----------------
@@ -729,91 +735,117 @@ async def scrape_one_amazon_sa(url_or_asin):
         "error": None,
     }
 
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            context = await browser.new_context(
-                user_agent=USER_AGENT,
-                viewport={"width": 1200, "height": 800},
-                locale="en-US",
-            )
-            page = await context.new_page()
-            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_timeout(650)
+    for attempt in range(2):
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+                context = await browser.new_context(
+                    user_agent=USER_AGENT,
+                    viewport={"width": 1200, "height": 800},
+                    locale="en-US",
+                )
+                page = await context.new_page()
+                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(650)
 
-            # Title
-            title = None
-            try:
-                title = await page.locator("#productTitle").first.inner_text(timeout=4000)
-                title = title.strip()
-            except Exception:
+                # Title
                 title = None
-
-            # Price
-            price_text = None
-            price_value = None
-            price_selectors = [
-                "#corePriceDisplay_desktop_feature_div span.a-price span.a-offscreen",
-                "#corePrice_feature_div span.a-price span.a-offscreen",
-                "span.a-price span.a-offscreen",
-                "#priceblock_ourprice",
-                "#priceblock_dealprice",
-                "#priceblock_saleprice",
-            ]
-            for sel in price_selectors:
                 try:
-                    price_text = await page.locator(sel).first.inner_text(timeout=2500)
-                    price_text = price_text.strip()
-                    if price_text:
-                        break
+                    title = await page.locator("#productTitle").first.inner_text(timeout=4000)
+                    title = title.strip()
                 except Exception:
-                    continue
+                    title = None
 
-            if price_text:
-                price_value = parse_money_value(price_text)
+                # Price
+                price_text = None
+                price_value = None
+                price_selectors = [
+                    "#corePriceDisplay_desktop_feature_div span.a-price span.a-offscreen",
+                    "#corePrice_feature_div span.a-price span.a-offscreen",
+                    "span.a-price span.a-offscreen",
+                    "#priceblock_ourprice",
+                    "#priceblock_dealprice",
+                    "#priceblock_saleprice",
+                ]
+                for sel in price_selectors:
+                    try:
+                        price_text = await page.locator(sel).first.inner_text(timeout=2500)
+                        price_text = price_text.strip()
+                        if price_text:
+                            break
+                    except Exception:
+                        continue
 
-            # Coupon / promo text
-            coupon_text = None
-            coupon_candidates = [
-                "label[id*='coupon']",
-                "#couponBadge",
-                "#vpcButton .a-color-success",
-                "#promoPriceBlockMessage_feature_div",
-                ".promoPriceBlockMessage",
-                "#promotions_feature_div",
-            ]
-            for sel in coupon_candidates:
-                try:
-                    t = await page.locator(sel).first.inner_text(timeout=1500)
-                    t = (t or "").strip()
-                    if t and ("coupon" in t.lower() or "%" in t or "save" in t.lower() or "off" in t.lower()):
-                        coupon_text = t
-                        break
-                except Exception:
-                    continue
+                if price_text:
+                    price_value = parse_money_value(price_text)
 
-            discount_percent = None
-            # Prefer percent from coupon_text
-            if coupon_text:
-                discount_percent = max_percent_from_text(coupon_text)
+                # Coupon / promo text
+                coupon_text = None
+                coupon_candidates = [
+                    "label[id*='coupon']",
+                    "#couponBadge",
+                    "#vpcButton .a-color-success",
+                    "#promoPriceBlockMessage_feature_div",
+                    ".promoPriceBlockMessage",
+                    "#promotions_feature_div",
+                ]
+                for sel in coupon_candidates:
+                    try:
+                        t = await page.locator(sel).first.inner_text(timeout=1500)
+                        t = (t or "").strip()
+                        if t and ("coupon" in t.lower() or "%" in t or "save" in t.lower() or "off" in t.lower()):
+                            coupon_text = t
+                            break
+                    except Exception:
+                        continue
 
-            out.update(
-                {
-                    "item_name": title,
-                    "price_text": price_text,
-                    "price_value": price_value,
-                    "coupon_text": coupon_text,
-                    "discount_percent": discount_percent,
-                }
-            )
+                discount_percent = None
+                # Prefer percent from coupon_text
+                if coupon_text:
+                    discount_percent = max_percent_from_text(coupon_text)
 
-            await context.close()
-            await browser.close()
+                out.update(
+                    {
+                        "item_name": title,
+                        "price_text": price_text,
+                        "price_value": price_value,
+                        "coupon_text": coupon_text,
+                        "discount_percent": discount_percent,
+                    }
+                )
 
-    except Exception as e:
-        out["error"] = str(e)
+                await context.close()
+                await browser.close()
+                break
+
+        except Exception as e:
+            error_text = str(e)
+            if attempt == 0 and "Executable doesn't exist" in error_text and _ensure_playwright_browsers():
+                continue
+            out["error"] = error_text
+            break
 
     return out
+
+
+def _ensure_playwright_browsers():
+    """Best-effort install when Render image is missing Playwright executables."""
+    global _PLAYWRIGHT_INSTALL_TRIED
+    with _PLAYWRIGHT_INSTALL_LOCK:
+        if _PLAYWRIGHT_INSTALL_TRIED:
+            return False
+        _PLAYWRIGHT_INSTALL_TRIED = True
+
+    commands = [
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        [sys.executable, "-m", "playwright", "install", "chromium-headless-shell"],
+    ]
+    for cmd in commands:
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
+        except Exception:
+            pass
+    return True
 
 
 def run_async(coro_fn, *args, **kwargs):

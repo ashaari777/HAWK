@@ -14,6 +14,18 @@ struct PricePoint: Codable, Hashable, Identifiable {
     }
 }
 
+struct AppEventLogEntry: Codable, Hashable, Identifiable {
+    let id: UUID
+    let timestamp: Date
+    let message: String
+
+    init(id: UUID = UUID(), timestamp: Date = Date(), message: String) {
+        self.id = id
+        self.timestamp = timestamp
+        self.message = message
+    }
+}
+
 struct TrackedItem: Identifiable, Codable, Equatable {
     var id: UUID
     var remoteItemID: Int?
@@ -724,12 +736,14 @@ private final class HAWKAdminAPIClient {
 final class AppConfig: ObservableObject {
     @Published private(set) var items: [TrackedItem] = []
     @Published private(set) var activeChecks: Set<UUID> = []
+    @Published private(set) var eventLogs: [AppEventLogEntry] = []
     @Published var notificationsEnabled: Bool
     @Published private(set) var notificationAuthorizationStatus = "Unknown"
     @Published private(set) var lastCheckRunAt: Date?
     @Published private(set) var nextAutoCheckAt: Date?
 
     private let itemsKey = "hawk_admin_items"
+    private let eventLogsKey = "hawk_admin_event_logs"
     private let backendUserIDKey = "hawk_admin_backend_user_id"
     private let notificationsEnabledKey = "hawk_admin_notifications_enabled"
     private let checkRunAtKey = "hawk_admin_last_check_run_at"
@@ -738,6 +752,7 @@ final class AppConfig: ObservableObject {
     private var didRegisterBackgroundTask = false
     private var foregroundSchedulerTimer: Timer?
     private var backendUserID: Int?
+    private let maxEventLogCount = 250
     private var updateIntervalSeconds: TimeInterval =
         TimeInterval(HAWKAdminRemoteConfig.forcedUpdateIntervalSeconds ?? (60 * 60))
 
@@ -760,10 +775,12 @@ final class AppConfig: ObservableObject {
         }
         backendUserID = UserDefaults.standard.object(forKey: backendUserIDKey) as? Int
         loadItems()
+        loadEventLogs()
         registerBackgroundRefreshTaskIfNeeded()
         if nextAutoCheckAt == nil {
             scheduleNextAutoCheck(from: Date())
         }
+        addEventLog("App launched")
         Task {
             await refreshNotificationStatus()
             await syncFromServer(markRun: false)
@@ -799,6 +816,7 @@ final class AppConfig: ObservableObject {
 
     func appDidBecomeActive() {
         startForegroundScheduler()
+        addEventLog("App became active")
         Task {
             await syncFromServer(markRun: false)
             await runScheduledCheckIfDue()
@@ -807,6 +825,7 @@ final class AppConfig: ObservableObject {
 
     func appDidEnterBackground() {
         stopForegroundScheduler()
+        addEventLog("App entered background")
         scheduleBackgroundRefreshTask()
     }
 
@@ -831,6 +850,7 @@ final class AppConfig: ObservableObject {
             throw HAWKLocalError.backendNotConfigured
         }
 
+        addEventLog("Add item requested")
         let parsed = try await ProductInputParser.parse(input: input)
         if items.contains(where: { $0.asin == parsed.asin }) {
             throw HAWKLocalError.duplicateASIN(parsed.asin)
@@ -844,6 +864,7 @@ final class AppConfig: ObservableObject {
             targetPriceValue: (targetPrice ?? 0) > 0 ? targetPrice : nil
         )
         await syncFromServer(markRun: true)
+        addEventLog("Item added: \(parsed.asin)")
     }
 
     func updateTargetPrice(id: UUID, value: Double) throws {
@@ -857,6 +878,7 @@ final class AppConfig: ObservableObject {
         items[idx].targetPrice = value
         items[idx].lastError = nil
         saveItems()
+        addEventLog("Target updated for \(items[idx].displayTitle): \(value.formattedNumberOnly())")
 
         guard let remoteID, HAWKAdminRemoteConfig.isConfigured else {
             return
@@ -872,6 +894,7 @@ final class AppConfig: ObservableObject {
                 )
                 await syncFromServer(markRun: false)
             } catch {
+                addEventLog("Target update failed: \(error.localizedDescription)")
                 updateItem(id: id) { item in
                     item.lastError = error.localizedDescription
                 }
@@ -883,6 +906,7 @@ final class AppConfig: ObservableObject {
         guard let existing = items.first(where: { $0.id == id }) else {
             return
         }
+        addEventLog("Deleted item: \(existing.displayTitle)")
         items.removeAll { $0.id == id }
         saveItems()
 
@@ -910,8 +934,10 @@ final class AppConfig: ObservableObject {
 
     func clearAllItems() {
         let remoteIDs = items.compactMap(\.remoteItemID)
+        let count = items.count
         items.removeAll()
         saveItems()
+        addEventLog("Deleted all items (\(count))")
 
         guard HAWKAdminRemoteConfig.isConfigured, !remoteIDs.isEmpty else {
             return
@@ -988,6 +1014,7 @@ final class AppConfig: ObservableObject {
 
         activeChecks.insert(id)
         defer { activeChecks.remove(id) }
+        addEventLog("Check started: \(snapshot.displayTitle)")
 
         do {
             let uid = try await ensureBackendUser()
@@ -1002,11 +1029,13 @@ final class AppConfig: ObservableObject {
                 )
             }
             await syncFromServer(markRun: true)
+            addEventLog("Check finished: \(snapshot.displayTitle)")
         } catch {
             updateItem(id: id) { item in
                 item.lastCheckedAt = Date()
                 item.lastError = error.localizedDescription
             }
+            addEventLog("Check failed: \(error.localizedDescription)")
             markCheckRunNow()
         }
     }
@@ -1028,11 +1057,15 @@ final class AppConfig: ObservableObject {
         let ids = Set(items.map(\.id))
         activeChecks.formUnion(ids)
         defer { activeChecks.subtract(ids) }
+        addEventLog("Check all started (\(ids.count) items)")
 
         do {
             let uid = try await ensureBackendUser()
-            _ = try await HAWKAdminAPIClient.shared.checkAll(userID: uid)
+            let response = try await HAWKAdminAPIClient.shared.checkAll(userID: uid)
             await syncFromServer(markRun: true)
+            let updated = response.updatedItems ?? 0
+            let failed = response.errorItems ?? 0
+            addEventLog("Check all finished: updated \(updated), errors \(failed)")
         } catch {
             for itemID in ids {
                 updateItem(id: itemID) { item in
@@ -1040,6 +1073,7 @@ final class AppConfig: ObservableObject {
                     item.lastCheckedAt = Date()
                 }
             }
+            addEventLog("Check all failed: \(error.localizedDescription)")
             markCheckRunNow()
         }
     }
@@ -1059,9 +1093,11 @@ final class AppConfig: ObservableObject {
     }
 
     private func runAutomaticCheckCycle() async {
+        addEventLog("Automatic update cycle started")
         await syncFromServer(markRun: false)
         scheduleNextAutoCheck(from: Date())
         scheduleBackgroundRefreshTask()
+        addEventLog("Automatic update cycle finished")
     }
 
     private func scheduleNextAutoCheck(from date: Date) {
@@ -1112,6 +1148,7 @@ final class AppConfig: ObservableObject {
     }
 
     private func handleBackgroundRefreshTask(_ task: BGAppRefreshTask) async {
+        addEventLog("Background refresh task started")
         scheduleBackgroundRefreshTask()
         let work = Task { @MainActor in
             await runAutomaticCheckCycle()
@@ -1121,6 +1158,7 @@ final class AppConfig: ObservableObject {
         }
         await work.value
         task.setTaskCompleted(success: !work.isCancelled)
+        addEventLog(work.isCancelled ? "Background refresh cancelled" : "Background refresh completed")
     }
 
     private func applyUpdateInterval(serverValue: Int?) {
@@ -1178,10 +1216,12 @@ final class AppConfig: ObservableObject {
 
             scheduleBackgroundRefreshTask()
             evaluateTargetNotifications()
+            addEventLog("Sync success: \(items.count) items")
         } catch {
             if markRun {
                 markCheckRunNow()
             }
+            addEventLog("Sync failed: \(error.localizedDescription)")
             if !items.isEmpty {
                 for item in items {
                     updateItem(id: item.id) { tracked in
@@ -1324,6 +1364,42 @@ final class AppConfig: ObservableObject {
             UserDefaults.standard.set(data, forKey: itemsKey)
         } catch {
             // Ignore write errors to avoid crashing the UI flow.
+        }
+    }
+
+    func clearEventLogs() {
+        eventLogs.removeAll()
+        UserDefaults.standard.removeObject(forKey: eventLogsKey)
+    }
+
+    private func addEventLog(_ message: String) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        eventLogs.insert(AppEventLogEntry(message: trimmed), at: 0)
+        if eventLogs.count > maxEventLogCount {
+            eventLogs = Array(eventLogs.prefix(maxEventLogCount))
+        }
+        saveEventLogs()
+    }
+
+    private func loadEventLogs() {
+        guard let data = UserDefaults.standard.data(forKey: eventLogsKey) else {
+            eventLogs = []
+            return
+        }
+        do {
+            eventLogs = try JSONDecoder().decode([AppEventLogEntry].self, from: data)
+        } catch {
+            eventLogs = []
+        }
+    }
+
+    private func saveEventLogs() {
+        do {
+            let data = try JSONEncoder().encode(eventLogs)
+            UserDefaults.standard.set(data, forKey: eventLogsKey)
+        } catch {
+            // Ignore write errors to avoid blocking app flow.
         }
     }
 }
