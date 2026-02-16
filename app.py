@@ -371,15 +371,17 @@ def get_or_create_mobile_user(email):
 
     conn = db_conn()
     cur = conn.cursor()
-    # Use UPSERT to avoid race-condition 500s when bootstrap is called concurrently.
+    cur.execute("SELECT * FROM users WHERE lower(email)=%s", (em,))
+    existing = cur.fetchone()
+    if existing:
+        conn.close()
+        return existing
+
     random_password = base64.urlsafe_b64encode(os.urandom(24)).decode("utf-8")
     cur.execute(
         """
         INSERT INTO users(email, password_hash, role, is_approved, is_paused, created_at)
         VALUES(%s, %s, 'admin', TRUE, FALSE, %s)
-        ON CONFLICT (email) DO UPDATE SET
-            is_approved = TRUE,
-            is_paused = FALSE
         RETURNING *
         """,
         (em, generate_password_hash(random_password), now_utc_str()),
@@ -390,11 +392,11 @@ def get_or_create_mobile_user(email):
     return created
 
 
-def parse_user_id_from_request():
-    data = request.get_json(silent=True) or {}
-    candidate = data.get("user_id")
+def parse_user_id_from_request(data=None):
+    payload = data if isinstance(data, dict) else (request.get_json(silent=True) or {})
+    candidate = payload.get("user_id")
     if candidate is None:
-        candidate = data.get("userID")
+        candidate = payload.get("userID")
     if candidate is None:
         candidate = request.args.get("user_id")
     if candidate is None:
@@ -828,27 +830,73 @@ def write_history(item_id, data):
     - If coupon_text exists, update latest row coupon_text.
     """
 
-    if not data.get("price_value"):
-        if data.get("coupon_text"):
-            conn = db_conn()
-            cur = conn.cursor()
+    has_price_value = data.get("price_value") not in (None, "")
+    if not has_price_value:
+        has_metadata = any(
+            [
+                data.get("item_name"),
+                data.get("coupon_text"),
+                data.get("error"),
+                data.get("discount_percent") is not None,
+            ]
+        )
+        if not has_metadata:
+            return
+
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id FROM price_history
+            WHERE item_id=%s
+            ORDER BY ts DESC
+            LIMIT 1
+            """,
+            (item_id,),
+        )
+        latest_row = cur.fetchone()
+        ts_value = data.get("timestamp") or now_utc_str()
+
+        if latest_row:
             cur.execute(
                 """
-                SELECT id FROM price_history
-                WHERE item_id=%s
-                ORDER BY ts DESC
-                LIMIT 1
+                UPDATE price_history
+                SET
+                    ts=%s,
+                    item_name=COALESCE(%s, item_name),
+                    coupon_text=COALESCE(%s, coupon_text),
+                    discount_percent=COALESCE(%s, discount_percent),
+                    error=%s
+                WHERE id=%s
                 """,
-                (item_id,),
+                (
+                    ts_value,
+                    data.get("item_name"),
+                    data.get("coupon_text"),
+                    data.get("discount_percent"),
+                    data.get("error"),
+                    latest_row["id"],
+                ),
             )
-            latest_row = cur.fetchone()
-            if latest_row:
-                cur.execute(
-                    "UPDATE price_history SET coupon_text=%s WHERE id=%s",
-                    (data["coupon_text"], latest_row["id"]),
-                )
-                conn.commit()
-            conn.close()
+        else:
+            cur.execute(
+                """
+                INSERT INTO price_history(item_id, ts, item_name, price_text, price_value, coupon_text, discount_percent, error)
+                VALUES(%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    item_id,
+                    ts_value,
+                    data.get("item_name"),
+                    data.get("price_text"),
+                    None,
+                    data.get("coupon_text"),
+                    data.get("discount_percent"),
+                    data.get("error"),
+                ),
+            )
+        conn.commit()
+        conn.close()
         return
 
     conn = db_conn()
@@ -1413,15 +1461,11 @@ def api_mobile_items():
 @mobile_api_required
 def api_mobile_add_item():
     data = request.get_json(silent=True) or {}
-    user_id = data.get("user_id")
-    if user_id is None:
-        user_id = data.get("userID")
+    user_id = parse_user_id_from_request(data)
     asin = (data.get("asin") or "").strip().upper()
     url = (data.get("url") or "").strip()
 
-    try:
-        user_id = int(user_id)
-    except Exception:
+    if not user_id:
         return jsonify({"ok": False, "error": "valid user_id is required"}), 400
 
     if not asin:
@@ -1430,7 +1474,7 @@ def api_mobile_add_item():
         url = f"https://www.amazon.sa/dp/{asin}?language=en"
 
     target = data.get("target_price_value")
-    if target is None:
+    if target in (None, ""):
         target = data.get("targetPriceValue")
     target_value = None
     if target not in (None, ""):
@@ -1477,16 +1521,12 @@ def api_mobile_add_item():
 @mobile_api_required
 def api_mobile_update_target(item_id):
     data = request.get_json(silent=True) or {}
-    user_id = data.get("user_id")
-    if user_id is None:
-        user_id = data.get("userID")
+    user_id = parse_user_id_from_request(data)
     target = data.get("target_price_value")
-    if target is None:
+    if target in (None, ""):
         target = data.get("targetPriceValue")
 
-    try:
-        user_id = int(user_id)
-    except Exception:
+    if not user_id:
         return jsonify({"ok": False, "error": "valid user_id is required"}), 400
 
     try:
@@ -1537,12 +1577,8 @@ def api_mobile_delete_item(item_id):
 @mobile_api_required
 def api_mobile_check_item(item_id):
     data = request.get_json(silent=True) or {}
-    user_id = data.get("user_id")
-    if user_id is None:
-        user_id = data.get("userID")
-    try:
-        user_id = int(user_id)
-    except Exception:
+    user_id = parse_user_id_from_request(data)
+    if not user_id:
         return jsonify({"ok": False, "error": "valid user_id is required"}), 400
 
     conn = db_conn()
@@ -1566,12 +1602,8 @@ def api_mobile_check_item(item_id):
 @mobile_api_required
 def api_mobile_check_all():
     data = request.get_json(silent=True) or {}
-    user_id = data.get("user_id")
-    if user_id is None:
-        user_id = data.get("userID")
-    try:
-        user_id = int(user_id)
-    except Exception:
+    user_id = parse_user_id_from_request(data)
+    if not user_id:
         return jsonify({"ok": False, "error": "valid user_id is required"}), 400
 
     conn = db_conn()
