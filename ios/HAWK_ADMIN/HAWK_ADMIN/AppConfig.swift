@@ -529,8 +529,8 @@ private final class HAWKAdminAPIClient {
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.waitsForConnectivity = true
-        config.timeoutIntervalForRequest = 60
-        config.timeoutIntervalForResource = 120
+        config.timeoutIntervalForRequest = 90
+        config.timeoutIntervalForResource = 600
         return URLSession(configuration: config)
     }()
 
@@ -1094,7 +1094,11 @@ final class AppConfig: ObservableObject {
 
     private func runAutomaticCheckCycle() async {
         addEventLog("Automatic update cycle started")
-        await syncFromServer(markRun: false)
+        if items.isEmpty {
+            await syncFromServer(markRun: false)
+        } else {
+            await checkAllItems()
+        }
         scheduleNextAutoCheck(from: Date())
         scheduleBackgroundRefreshTask()
         addEventLog("Automatic update cycle finished")
