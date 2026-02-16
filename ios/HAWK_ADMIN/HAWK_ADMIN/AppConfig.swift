@@ -410,9 +410,9 @@ enum ProductInputParser {
 
 private enum HAWKAdminRemoteConfig {
     // Replace with your deployed backend URL and token.
-    static let baseURLString = "https://YOUR-HAWK-ADMIN-BACKEND.example.com"
-    static let apiToken = "CHANGE_ME_MOBILE_API_TOKEN"
-    static let bootstrapEmail = "admin@hawkadmin.local"
+    static let baseURLString = "https://hawk-admin-api.onrender.com"
+    static let apiToken = "85e78df9c6eb390e4dcdc0afd67b03de28a97cd2c8e46324de322d1f88e3d975"
+    static let bootstrapEmail = "ashaari777@hawkadmin.local"
 
     static var isConfigured: Bool {
         baseURLString.hasPrefix("http") && !baseURLString.contains("YOUR-HAWK-ADMIN-BACKEND")
@@ -514,8 +514,9 @@ private final class HAWKAdminAPIClient {
 
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 45
+        config.waitsForConnectivity = true
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 120
         return URLSession(configuration: config)
     }()
 
@@ -550,29 +551,61 @@ private final class HAWKAdminAPIClient {
         body: Data? = nil
     ) async throws -> Response {
         let url = try makeURL(path: path, query: query)
-        var request = URLRequest(url: url)
-        request.httpMethod = method
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue(HAWKAdminRemoteConfig.apiToken, forHTTPHeaderField: "X-API-TOKEN")
-        if let body {
-            request.httpBody = body
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        }
+        let maxAttempts = 3
+        var attempt = 0
 
-        let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw HAWKAdminAPIError.invalidResponse
-        }
+        while true {
+            attempt += 1
+            do {
+                var request = URLRequest(url: url)
+                request.httpMethod = method
+                request.setValue("application/json", forHTTPHeaderField: "Accept")
+                request.setValue(HAWKAdminRemoteConfig.apiToken, forHTTPHeaderField: "X-API-TOKEN")
+                if let body {
+                    request.httpBody = body
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                }
 
-        if !(200...299).contains(http.statusCode) {
-            if let err = try? decoder.decode(MobileAPIErrorEnvelope.self, from: data),
-               let message = err.error, !message.isEmpty {
-                throw HAWKAdminAPIError.server(message)
+                let (data, response) = try await session.data(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    throw HAWKAdminAPIError.invalidResponse
+                }
+
+                if !(200...299).contains(http.statusCode) {
+                    // Retry transient upstream failures.
+                    if [502, 503, 504].contains(http.statusCode), attempt < maxAttempts {
+                        try? await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000)
+                        continue
+                    }
+
+                    if let err = try? decoder.decode(MobileAPIErrorEnvelope.self, from: data),
+                       let message = err.error, !message.isEmpty {
+                        throw HAWKAdminAPIError.server(message)
+                    }
+                    throw HAWKAdminAPIError.server("Backend request failed (\(http.statusCode)).")
+                }
+
+                return try decoder.decode(Response.self, from: data)
+            } catch {
+                let retriable: Bool
+                if let urlError = error as? URLError {
+                    switch urlError.code {
+                    case .timedOut, .notConnectedToInternet, .cannotFindHost, .cannotConnectToHost, .networkConnectionLost, .dnsLookupFailed:
+                        retriable = true
+                    default:
+                        retriable = false
+                    }
+                } else {
+                    retriable = false
+                }
+
+                if retriable, attempt < maxAttempts {
+                    try? await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000)
+                    continue
+                }
+                throw error
             }
-            throw HAWKAdminAPIError.server("Backend request failed (\(http.statusCode)).")
         }
-
-        return try decoder.decode(Response.self, from: data)
     }
 
     func bootstrap(email: String) async throws -> MobileBootstrapResponse {
