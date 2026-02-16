@@ -371,17 +371,15 @@ def get_or_create_mobile_user(email):
 
     conn = db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE lower(email)=%s", (em,))
-    existing = cur.fetchone()
-    if existing:
-        conn.close()
-        return existing
-
+    # Use UPSERT to avoid race-condition 500s when bootstrap is called concurrently.
     random_password = base64.urlsafe_b64encode(os.urandom(24)).decode("utf-8")
     cur.execute(
         """
         INSERT INTO users(email, password_hash, role, is_approved, is_paused, created_at)
         VALUES(%s, %s, 'admin', TRUE, FALSE, %s)
+        ON CONFLICT (email) DO UPDATE SET
+            is_approved = TRUE,
+            is_paused = FALSE
         RETURNING *
         """,
         (em, generate_password_hash(random_password), now_utc_str()),
@@ -396,7 +394,11 @@ def parse_user_id_from_request():
     data = request.get_json(silent=True) or {}
     candidate = data.get("user_id")
     if candidate is None:
+        candidate = data.get("userID")
+    if candidate is None:
         candidate = request.args.get("user_id")
+    if candidate is None:
+        candidate = request.args.get("userID")
     try:
         return int(candidate)
     except Exception:
@@ -1412,6 +1414,8 @@ def api_mobile_items():
 def api_mobile_add_item():
     data = request.get_json(silent=True) or {}
     user_id = data.get("user_id")
+    if user_id is None:
+        user_id = data.get("userID")
     asin = (data.get("asin") or "").strip().upper()
     url = (data.get("url") or "").strip()
 
@@ -1426,6 +1430,8 @@ def api_mobile_add_item():
         url = f"https://www.amazon.sa/dp/{asin}?language=en"
 
     target = data.get("target_price_value")
+    if target is None:
+        target = data.get("targetPriceValue")
     target_value = None
     if target not in (None, ""):
         try:
@@ -1472,7 +1478,11 @@ def api_mobile_add_item():
 def api_mobile_update_target(item_id):
     data = request.get_json(silent=True) or {}
     user_id = data.get("user_id")
+    if user_id is None:
+        user_id = data.get("userID")
     target = data.get("target_price_value")
+    if target is None:
+        target = data.get("targetPriceValue")
 
     try:
         user_id = int(user_id)
@@ -1528,6 +1538,8 @@ def api_mobile_delete_item(item_id):
 def api_mobile_check_item(item_id):
     data = request.get_json(silent=True) or {}
     user_id = data.get("user_id")
+    if user_id is None:
+        user_id = data.get("userID")
     try:
         user_id = int(user_id)
     except Exception:
@@ -1555,6 +1567,8 @@ def api_mobile_check_item(item_id):
 def api_mobile_check_all():
     data = request.get_json(silent=True) or {}
     user_id = data.get("user_id")
+    if user_id is None:
+        user_id = data.get("userID")
     try:
         user_id = int(user_id)
     except Exception:
