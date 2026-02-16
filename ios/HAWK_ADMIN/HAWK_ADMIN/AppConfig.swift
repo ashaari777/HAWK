@@ -413,6 +413,8 @@ private enum HAWKAdminRemoteConfig {
     static let baseURLString = "https://hawk-admin-api.onrender.com"
     static let apiToken = "85e78df9c6eb390e4dcdc0afd67b03de28a97cd2c8e46324de322d1f88e3d975"
     static let bootstrapEmail = "ashaari777@hawkadmin.local"
+    // Test mode: keep auto-update every 15 minutes. Set to nil to use backend interval.
+    static let forcedUpdateIntervalSeconds: Int? = 15 * 60
 
     static var isConfigured: Bool {
         baseURLString.hasPrefix("http") && !baseURLString.contains("YOUR-HAWK-ADMIN-BACKEND")
@@ -526,7 +528,11 @@ private final class HAWKAdminAPIClient {
         return decoder
     }()
 
-    private let encoder = JSONEncoder()
+    private let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        return encoder
+    }()
 
     private init() {}
 
@@ -572,7 +578,6 @@ private final class HAWKAdminAPIClient {
                 }
 
                 if !(200...299).contains(http.statusCode) {
-                    // Retry transient upstream failures.
                     if [502, 503, 504].contains(http.statusCode), attempt < maxAttempts {
                         try? await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000)
                         continue
@@ -733,7 +738,8 @@ final class AppConfig: ObservableObject {
     private var didRegisterBackgroundTask = false
     private var foregroundSchedulerTimer: Timer?
     private var backendUserID: Int?
-    private var updateIntervalSeconds: TimeInterval = 60 * 60
+    private var updateIntervalSeconds: TimeInterval =
+        TimeInterval(HAWKAdminRemoteConfig.forcedUpdateIntervalSeconds ?? (60 * 60))
 
     private static let serverDateFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -1117,6 +1123,16 @@ final class AppConfig: ObservableObject {
         task.setTaskCompleted(success: !work.isCancelled)
     }
 
+    private func applyUpdateInterval(serverValue: Int?) {
+        if let forced = HAWKAdminRemoteConfig.forcedUpdateIntervalSeconds {
+            updateIntervalSeconds = TimeInterval(max(300, forced))
+            return
+        }
+        if let serverValue {
+            updateIntervalSeconds = TimeInterval(max(300, serverValue))
+        }
+    }
+
     private func ensureBackendUser() async throws -> Int {
         if !HAWKAdminRemoteConfig.isConfigured {
             throw HAWKLocalError.backendNotConfigured
@@ -1132,9 +1148,7 @@ final class AppConfig: ObservableObject {
         backendUserID = userID
         UserDefaults.standard.set(userID, forKey: backendUserIDKey)
 
-        if let interval = bootstrap.updateIntervalSeconds {
-            updateIntervalSeconds = TimeInterval(max(300, interval))
-        }
+        applyUpdateInterval(serverValue: bootstrap.updateIntervalSeconds)
         if let lastRun = parseServerDate(bootstrap.lastGlobalRun) {
             lastCheckRunAt = lastRun
             UserDefaults.standard.set(lastRun, forKey: checkRunAtKey)
@@ -1152,9 +1166,7 @@ final class AppConfig: ObservableObject {
         do {
             let uid = try await ensureBackendUser()
             let payload = try await HAWKAdminAPIClient.shared.fetchItems(userID: uid)
-            if let interval = payload.updateIntervalSeconds {
-                updateIntervalSeconds = TimeInterval(max(300, interval))
-            }
+            applyUpdateInterval(serverValue: payload.updateIntervalSeconds)
 
             mergeRemoteItems(payload.items ?? [])
             if let lastRun = parseServerDate(payload.lastGlobalRun) {
@@ -1164,7 +1176,6 @@ final class AppConfig: ObservableObject {
                 markCheckRunNow()
             }
 
-            scheduleNextAutoCheck(from: Date())
             scheduleBackgroundRefreshTask()
             evaluateTargetNotifications()
         } catch {
