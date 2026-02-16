@@ -1,0 +1,29 @@
+name: HAWK_ADMIN Hourly Update
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+jobs:
+  trigger-cron-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger backend global update
+        env:
+          HAWK_ADMIN_BACKEND_URL: ${{ secrets.HAWK_ADMIN_BACKEND_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+        run: |
+          if [ -z "$HAWK_ADMIN_BACKEND_URL" ] || [ -z "$CRON_TOKEN" ]; then
+            echo "Missing required secrets: HAWK_ADMIN_BACKEND_URL and/or CRON_TOKEN"
+            exit 1
+          fi
+
+          URL="${HAWK_ADMIN_BACKEND_URL%/}/cron/update-all"
+          echo "Calling $URL"
+
+          curl --fail --show-error --silent \
+            -X POST "$URL" \
+            -H "X-CRON-TOKEN: $CRON_TOKEN"
+
+          echo "Hourly update trigger sent."
