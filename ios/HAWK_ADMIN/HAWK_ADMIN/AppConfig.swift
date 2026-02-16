@@ -857,12 +857,15 @@ final class AppConfig: ObservableObject {
         }
 
         let uid = try await ensureBackendUser()
-        _ = try await HAWKAdminAPIClient.shared.addItem(
+        let addResponse = try await HAWKAdminAPIClient.shared.addItem(
             userID: uid,
             asin: parsed.asin,
             url: parsed.canonicalURL,
             targetPriceValue: (targetPrice ?? 0) > 0 ? targetPrice : nil
         )
+        if let newRemoteID = addResponse.item?.id {
+            _ = try? await HAWKAdminAPIClient.shared.checkItem(userID: uid, itemID: newRemoteID)
+        }
         await syncFromServer(markRun: true)
         addEventLog("Item added: \(parsed.asin)")
     }

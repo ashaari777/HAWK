@@ -856,10 +856,11 @@ def run_async(coro_fn, *args, **kwargs):
 # ---------------- DB item/history logic ----------------
 
 def write_history(item_id, data):
-    """Write a history row with de-duplication by update_interval.
+    """Write a history row.
 
-    - If price_value is missing, do not insert a new row.
-    - If coupon_text exists, update latest row coupon_text.
+    Every successful check inserts a row, even if price is unchanged.
+    If price is missing but metadata exists (title/coupon/error), update latest row
+    or create a metadata-only row.
     """
 
     has_price_value = data.get("price_value") not in (None, "")
@@ -935,58 +936,22 @@ def write_history(item_id, data):
     cur = conn.cursor()
 
     cur.execute(
-        "SELECT * FROM price_history WHERE item_id=%s ORDER BY ts DESC LIMIT 1",
-        (item_id,),
+        """
+        INSERT INTO price_history(item_id, ts, item_name, price_text, price_value, coupon_text, discount_percent, error)
+        VALUES(%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            item_id,
+            data.get("timestamp") or now_utc_str(),
+            data.get("item_name"),
+            data.get("price_text"),
+            data.get("price_value"),
+            data.get("coupon_text"),
+            data.get("discount_percent"),
+            data.get("error"),
+        ),
     )
-    latest = cur.fetchone()
-
-    interval_str = get_setting("update_interval", "3600")  # default: 1 hour
-    try:
-        interval_sec = int(interval_str)
-    except Exception:
-        interval_sec = 1800
-
-    insert = True
-    if latest and latest.get("price_value") is not None:
-        try:
-            latest_val = float(latest["price_value"])
-        except Exception:
-            latest_val = None
-
-        # If same price and within interval, skip insert
-        if latest_val is not None and data.get("price_value") is not None:
-            try:
-                new_val = float(data["price_value"])
-            except Exception:
-                new_val = None
-
-            if new_val is not None and latest_val == new_val:
-                try:
-                    last_ts = datetime.strptime(latest["ts"], "%Y-%m-%d %H:%M:%S")
-                    new_ts = datetime.strptime(data["timestamp"], "%Y-%m-%d %H:%M:%S")
-                    if (new_ts - last_ts).total_seconds() < interval_sec:
-                        insert = False
-                except Exception:
-                    insert = True
-
-    if insert:
-        cur.execute(
-            """
-            INSERT INTO price_history(item_id, ts, item_name, price_text, price_value, coupon_text, discount_percent, error)
-            VALUES(%s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                item_id,
-                data.get("timestamp"),
-                data.get("item_name"),
-                data.get("price_text"),
-                data.get("price_value"),
-                data.get("coupon_text"),
-                data.get("discount_percent"),
-                data.get("error"),
-            ),
-        )
-        conn.commit()
+    conn.commit()
 
     conn.close()
     

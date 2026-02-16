@@ -36,28 +36,6 @@ struct SettingsView: View {
                     }
                 }
 
-                Section("Event Log") {
-                    if appConfig.eventLogs.isEmpty {
-                        Text("No events yet.")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(appConfig.eventLogs) { entry in
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(entry.message)
-                                    .font(.subheadline)
-                                Text(entry.timestamp.formatted(date: .abbreviated, time: .standard))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .padding(.vertical, 2)
-                        }
-                    }
-
-                    Button("Clear Event Log", role: .destructive) {
-                        appConfig.clearEventLogs()
-                    }
-                }
             }
             .navigationTitle("Settings")
             .toolbar {

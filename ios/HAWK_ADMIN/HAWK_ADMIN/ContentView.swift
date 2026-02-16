@@ -169,6 +169,20 @@ struct ContentView: View {
                 .foregroundStyle(.white)
                 .clipShape(RoundedRectangle(cornerRadius: 10))
 
+                Button("Clear") {
+                    productInput = ""
+                    targetPriceInput = ""
+                    addError = nil
+                    focusedAddField = nil
+                    dismissKeyboard()
+                }
+                .font(.system(size: 12, weight: .black))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Color.white.opacity(0.1))
+                .foregroundStyle(.white)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+
                 if let addError {
                     Text(addError)
                         .font(.system(size: 12, weight: .semibold))
@@ -533,7 +547,7 @@ private struct PriceChartView: View {
                         VStack(spacing: 2) {
                             Text(selectedPoint.price.formattedNumberOnly())
                                 .font(.system(size: 11, weight: .black))
-                            Text(selectedPoint.timestamp, format: .dateTime.day().month(.abbreviated))
+                            Text(keepaTimeLabel(selectedPoint.timestamp))
                                 .font(.system(size: 10, weight: .semibold))
                         }
                         .padding(.horizontal, 8)
@@ -634,6 +648,13 @@ private struct PriceChartView: View {
             return "--"
         }
         return date.formatted(.dateTime.day().month(.abbreviated))
+    }
+
+    private func keepaTimeLabel(_ date: Date?) -> String {
+        guard let date else {
+            return "--:--"
+        }
+        return date.formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits))
     }
 }
 
