@@ -425,8 +425,8 @@ private enum HAWKAdminRemoteConfig {
     static let baseURLString = "https://hawk-admin-api.onrender.com"
     static let apiToken = "85e78df9c6eb390e4dcdc0afd67b03de28a97cd2c8e46324de322d1f88e3d975"
     static let bootstrapEmail = "ashaari777@hawkadmin.local"
-    // Test mode: keep auto-update every 15 minutes. Set to nil to use backend interval.
-    static let forcedUpdateIntervalSeconds: Int? = 15 * 60
+    // Force app auto-update interval to 1 hour.
+    static let forcedUpdateIntervalSeconds: Int? = 60 * 60
 
     static var isConfigured: Bool {
         baseURLString.hasPrefix("http") && !baseURLString.contains("YOUR-HAWK-ADMIN-BACKEND")
