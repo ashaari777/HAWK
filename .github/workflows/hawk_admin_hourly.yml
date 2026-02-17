@@ -1,0 +1,53 @@
+name: HAWK Admin Hourly Update
+
+on:
+  schedule:
+    - cron: "5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  trigger-update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Trigger /cron/update-all with retries
+        env:
+          HAWK_ADMIN_BACKEND_URL: ${{ secrets.HAWK_ADMIN_BACKEND_URL }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${HAWK_ADMIN_BACKEND_URL:-}" ]; then
+            echo "Missing secret: HAWK_ADMIN_BACKEND_URL"
+            exit 1
+          fi
+          if [ -z "${CRON_TOKEN:-}" ]; then
+            echo "Missing secret: CRON_TOKEN"
+            exit 1
+          fi
+
+          URL="${HAWK_ADMIN_BACKEND_URL%/}/cron/update-all"
+          echo "Trigger URL: $URL"
+
+          for attempt in 1 2 3 4 5 6; do
+            echo "Attempt $attempt/6"
+            HTTP_CODE="$(curl -sS -o /tmp/resp.txt -w "%{http_code}" \
+              -X POST "$URL" \
+              -H "X-CRON-TOKEN: ${CRON_TOKEN}" \
+              --connect-timeout 30 \
+              --max-time 240 || true)"
+
+            echo "HTTP: $HTTP_CODE"
+            cat /tmp/resp.txt || true
+            echo
+
+            if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 300 ]; then
+              echo "Cron trigger accepted."
+              exit 0
+            fi
+
+            sleep 20
+          done
+
+          echo "Failed to trigger backend cron after retries."
+          exit 1
